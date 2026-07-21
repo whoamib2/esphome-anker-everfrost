@@ -1,20 +1,23 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import button
-from esphome.const import CONF_ID, ENTITY_CATEGORY_CONFIG, ICON_REFRESH
+from esphome.const import CONF_ID, ENTITY_CATEGORY_CONFIG
 
 from .climate import EverFrostClimate
 from .const import CONF_EVERFROST_ID, CONF_REFRESH
 
 everfrost_ns = cg.esphome_ns.namespace("everfrost")
-EverFrostRefreshButton = everfrost_ns.class_("EverFrostRefreshButton", button.Button)
+EverFrostRefreshButton = everfrost_ns.class_(
+    "EverFrostRefreshButton",
+    button.Button,
+)
 
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(CONF_EVERFROST_ID): cv.use_id(EverFrostClimate),
         cv.Optional(CONF_REFRESH): button.button_schema(
             EverFrostRefreshButton,
-            icon=ICON_REFRESH,
+            icon="mdi:refresh",
             entity_category=ENTITY_CATEGORY_CONFIG,
         ),
     }
