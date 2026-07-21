@@ -1,0 +1,6 @@
+CONF_EVERFROST_ID = "everfrost_id"
+CONF_BATTERY = "battery"
+CONF_CONNECTED = "connected"
+CONF_CURRENT_TEMPERATURE = "current_temperature"
+CONF_REFRESH = "refresh"
+CONF_RAW_PACKET_LOGGING = "raw_packet_logging"
