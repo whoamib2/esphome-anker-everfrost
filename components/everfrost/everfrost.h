@@ -8,6 +8,7 @@
 #include "esphome/components/button/button.h"
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
+#include "esphome/components/select/select.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/core/component.h"
 
@@ -31,9 +32,28 @@ class EverFrostZoneClimate : public climate::Climate {
 
   void publish_current_temperature_value(float temperature_c);
   void publish_target_temperature_value(float temperature_c);
+  void publish_power_value(bool enabled);
   void publish_disconnected();
 
  protected:
+  EverFrostClimate *parent_{nullptr};
+};
+
+class EverFrostVoltageProtectionSelect : public select::Select {
+ public:
+  void set_parent(EverFrostClimate *parent) { this->parent_ = parent; }
+
+ protected:
+  void control(size_t index) override;
+  EverFrostClimate *parent_{nullptr};
+};
+
+class EverFrostScreenBrightnessSelect : public select::Select {
+ public:
+  void set_parent(EverFrostClimate *parent) { this->parent_ = parent; }
+
+ protected:
+  void control(size_t index) override;
   EverFrostClimate *parent_{nullptr};
 };
 
@@ -68,9 +88,18 @@ class EverFrostClimate : public climate::Climate,
   }
   void set_raw_packet_logging(bool enabled) { this->raw_packet_logging_ = enabled; }
   void set_zone2_climate(EverFrostZoneClimate *climate) { this->zone2_climate_ = climate; }
+  void set_voltage_protection_select(select::Select *select) {
+    this->voltage_protection_select_ = select;
+  }
+  void set_screen_brightness_select(select::Select *select) {
+    this->screen_brightness_select_ = select;
+  }
 
   void request_status();
   void set_zone_target_temperature(uint8_t zone, float temperature_c);
+  void set_zone_power(uint8_t zone, bool enabled);
+  void set_voltage_protection(uint8_t level);
+  void set_screen_brightness(uint8_t level);
 
  protected:
   void parse_packet_(const uint8_t *data, uint16_t length);
@@ -80,11 +109,15 @@ class EverFrostClimate : public climate::Climate,
   void send_startup_request_();
   void send_target_temperature_(uint8_t zone, float temperature_c);
   void send_zone_power_(uint8_t zone, bool enabled);
+  void send_setting_(uint8_t command, uint8_t value);
   void publish_current_temperature_(float temperature_c);
   void publish_target_temperature_(float temperature_c);
   void publish_zone2_current_temperature_(float temperature_c);
   void publish_zone2_target_temperature_(float temperature_c);
+  void publish_zone_power_(uint8_t zone, bool enabled);
   void publish_battery_(uint8_t battery);
+  void publish_voltage_protection_(uint8_t level);
+  void publish_screen_brightness_(uint8_t level);
   void log_packet_(const char *prefix, const uint8_t *data, uint16_t length) const;
   void schedule_status_refresh_();
 
@@ -105,6 +138,8 @@ class EverFrostClimate : public climate::Climate,
   sensor::Sensor *battery_sensor_{nullptr};
   binary_sensor::BinarySensor *connected_binary_sensor_{nullptr};
   EverFrostZoneClimate *zone2_climate_{nullptr};
+  select::Select *voltage_protection_select_{nullptr};
+  select::Select *screen_brightness_select_{nullptr};
 };
 
 class EverFrostRefreshButton : public button::Button {
