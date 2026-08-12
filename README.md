@@ -21,7 +21,9 @@ Experimental ESPHome external component for Anker EverFrost powered coolers.
 - Separate ESPHome climate entities for Zone 1 and Zone 2
 - Current temperature for both zones
 - Target-temperature control and synchronization for both zones
-- Zone enable command automatically sent before a target change, matching the official app behavior
+- Independent Zone 1 / Zone 2 on/off control through the climate entities
+- Voltage-protection select: Low / Medium / High
+- Screen-brightness select: Low / Medium / High
 - Battery percentage and live battery notifications
 - Connection status
 - Manual refresh button
@@ -62,17 +64,47 @@ Notify characteristic: 0x8888
 Confirmed 50L commands/notifications:
 
 ```text
-Zone 1 set target command: 0x83
-Zone 2 set target command: 0x84
-Zone 1 enable command:     0x86
-Zone 2 enable command:     0x87
+Zone 1 set target command:       0x83
+Zone 2 set target command:       0x84
+Voltage protection command:     0x85
+Zone 1 power command:            0x86
+Zone 2 power command:            0x87
+Screen brightness command:      0x81
 
-Zone 1 current notification: 0x06
-Zone 2 current notification: 0x07
-Zone 1 target notification:  0x0C
-Zone 2 target notification:  0x0D
-Battery notification:        0x04
+Zone 1 current notification:     0x06
+Zone 2 current notification:     0x07
+Zone 1 target notification:      0x0C
+Zone 2 target notification:      0x0D
+Battery notification:            0x04
 ```
+
+For the observed setting commands:
+
+```text
+Zone power: 0 = off, 1 = on
+
+Voltage protection:
+0 = Low
+1 = Medium
+2 = High
+
+Screen brightness:
+0 = Low
+1 = Medium
+2 = High
+```
+
+The EverFrost 50 full-status packet currently decodes:
+
+- Byte 13: battery percentage
+- Byte 14: Zone 1 enabled
+- Byte 15: Zone 2 enabled
+- Byte 16: screen brightness
+- Byte 19: voltage protection
+- Byte 20: Zone 1 current temperature + 128
+- Byte 21: Zone 1 target temperature + 128
+- Byte 23: Zone 2 current temperature + 128
+- Byte 24: Zone 2 target temperature + 128
 
 Common checksum:
 
@@ -133,6 +165,20 @@ climate:
       name: "EverFrost 50 Zone 2"
 ```
 
+The two climate entities expose `Off` and `Cool` modes. Changing a target temperature automatically turns that zone back on, matching the behavior observed from the official Anker app.
+
+Optional EverFrost 50 settings:
+
+```yaml
+select:
+  - platform: everfrost
+    everfrost_id: everfrost_50
+    voltage_protection:
+      name: "EverFrost 50 Voltage Protection"
+    screen_brightness:
+      name: "EverFrost 50 Screen Brightness"
+```
+
 ## Initial testing
 
 For first boot after a protocol/component update, keep:
@@ -141,7 +187,7 @@ For first boot after a protocol/component update, keep:
 raw_packet_logging: true
 ```
 
-Confirm that the BLE model is detected, both zone temperatures synchronize on the EverFrost 50, and target changes from Home Assistant are reflected by the cooler. After validation, raw packet logging can be disabled.
+Confirm that the BLE model is detected, both zone temperatures synchronize, both zones can be turned off/on independently, and the voltage-protection and brightness selects match the cooler. After validation, raw packet logging can be disabled.
 
 ## Status
 
