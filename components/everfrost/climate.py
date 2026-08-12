@@ -35,14 +35,21 @@ CONFIG_SCHEMA = (
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
+
+    zone2 = None
+    zone2_config = None
+    if CONF_ZONE_2 in config:
+        zone2_config = config[CONF_ZONE_2]
+        zone2 = cg.new_Pvariable(zone2_config[CONF_ID])
+        # Attach the child before entity registration so the parent climate traits
+        # already expose Off/Cool when Home Assistant discovers the entity.
+        cg.add(zone2.set_parent(var))
+        cg.add(var.set_zone2_climate(zone2))
+
     await cg.register_component(var, config)
     await climate.register_climate(var, config)
     await ble_client.register_ble_node(var, config)
     cg.add(var.set_raw_packet_logging(config[CONF_RAW_PACKET_LOGGING]))
 
-    if CONF_ZONE_2 in config:
-        zone2_config = config[CONF_ZONE_2]
-        zone2 = cg.new_Pvariable(zone2_config[CONF_ID])
+    if zone2 is not None:
         await climate.register_climate(zone2, zone2_config)
-        cg.add(zone2.set_parent(var))
-        cg.add(var.set_zone2_climate(zone2))
