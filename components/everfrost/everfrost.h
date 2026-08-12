@@ -20,10 +20,33 @@ namespace everfrost {
 
 namespace espbt = esphome::esp32_ble_tracker;
 
+class EverFrostClimate;
+
+class EverFrostZoneClimate : public climate::Climate {
+ public:
+  void set_parent(EverFrostClimate *parent) { this->parent_ = parent; }
+
+  climate::ClimateTraits traits() override;
+  void control(const climate::ClimateCall &call) override;
+
+  void publish_current_temperature_value(float temperature_c);
+  void publish_target_temperature_value(float temperature_c);
+  void publish_disconnected();
+
+ protected:
+  EverFrostClimate *parent_{nullptr};
+};
+
 class EverFrostClimate : public climate::Climate,
                          public PollingComponent,
                          public ble_client::BLEClientNode {
  public:
+  enum Model : uint8_t {
+    MODEL_UNKNOWN = 0,
+    MODEL_30 = 30,
+    MODEL_50 = 50,
+  };
+
   void setup() override;
   void update() override;
   void dump_config() override;
@@ -44,8 +67,10 @@ class EverFrostClimate : public climate::Climate,
     this->connected_binary_sensor_ = sensor;
   }
   void set_raw_packet_logging(bool enabled) { this->raw_packet_logging_ = enabled; }
+  void set_zone2_climate(EverFrostZoneClimate *climate) { this->zone2_climate_ = climate; }
 
   void request_status();
+  void set_zone_target_temperature(uint8_t zone, float temperature_c);
 
  protected:
   void parse_packet_(const uint8_t *data, uint16_t length);
@@ -53,14 +78,18 @@ class EverFrostClimate : public climate::Climate,
   uint8_t checksum_(const uint8_t *data, uint16_t length) const;
   void write_packet_(const std::vector<uint8_t> &packet);
   void send_startup_request_();
-  void send_target_temperature_(float temperature_c);
+  void send_target_temperature_(uint8_t zone, float temperature_c);
+  void send_zone_power_(uint8_t zone, bool enabled);
   void publish_current_temperature_(float temperature_c);
   void publish_target_temperature_(float temperature_c);
+  void publish_zone2_current_temperature_(float temperature_c);
+  void publish_zone2_target_temperature_(float temperature_c);
   void publish_battery_(uint8_t battery);
   void log_packet_(const char *prefix, const uint8_t *data, uint16_t length) const;
+  void schedule_status_refresh_();
 
-  // EverFrost uses a 32-bit service UUID and 16-bit characteristic UUIDs.
-  static constexpr uint32_t SERVICE_UUID = 0x0156F5DA;
+  static constexpr uint32_t SERVICE_UUID_30 = 0x0156F5DA;
+  static constexpr uint32_t SERVICE_UUID_50 = 0x0158F5DA;
   static constexpr uint16_t WRITE_CHAR_UUID = 0x7777;
   static constexpr uint16_t NOTIFY_CHAR_UUID = 0x8888;
 
@@ -68,11 +97,14 @@ class EverFrostClimate : public climate::Climate,
   uint16_t notify_handle_{0};
   bool ready_{false};
   bool raw_packet_logging_{false};
+  Model model_{MODEL_UNKNOWN};
   int pending_target_f_{-999};
+  int pending_zone2_target_f_{-999};
 
   sensor::Sensor *current_temperature_sensor_{nullptr};
   sensor::Sensor *battery_sensor_{nullptr};
   binary_sensor::BinarySensor *connected_binary_sensor_{nullptr};
+  EverFrostZoneClimate *zone2_climate_{nullptr};
 };
 
 class EverFrostRefreshButton : public button::Button {
