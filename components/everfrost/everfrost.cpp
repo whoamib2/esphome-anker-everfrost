@@ -13,27 +13,7 @@ namespace everfrost {
 
 static const char *const TAG = "everfrost";
 
-void EverFrostClimate::setup() {
-  this->mode = climate::CLIMATE_MODE_COOL;
-  this->action = climate::CLIMATE_ACTION_IDLE;
-
-  if (this->connected_binary_sensor_ != nullptr)
-    this->connected_binary_sensor_->publish_initial_state(false);
-}
-
-void EverFrostClimate::dump_config() {
-  LOG_CLIMATE("", "Anker EverFrost", this);
-  ESP_LOGCONFIG(TAG, "  Service UUID: 0x%08" PRIX32, SERVICE_UUID);
-  ESP_LOGCONFIG(TAG, "  Write characteristic: 0x%04X", WRITE_CHAR_UUID);
-  ESP_LOGCONFIG(TAG, "  Notify characteristic: 0x%04X", NOTIFY_CHAR_UUID);
-  ESP_LOGCONFIG(TAG, "  Raw packet logging: %s", YESNO(this->raw_packet_logging_));
-  LOG_UPDATE_INTERVAL(this);
-  LOG_SENSOR("  ", "Current Temperature Sensor", this->current_temperature_sensor_);
-  LOG_SENSOR("  ", "Battery Sensor", this->battery_sensor_);
-  LOG_BINARY_SENSOR("  ", "Connected", this->connected_binary_sensor_);
-}
-
-climate::ClimateTraits EverFrostClimate::traits() {
+static climate::ClimateTraits everfrost_traits() {
   auto traits = climate::ClimateTraits();
   traits.set_supported_modes({climate::CLIMATE_MODE_COOL});
   traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
@@ -43,12 +23,70 @@ climate::ClimateTraits EverFrostClimate::traits() {
   return traits;
 }
 
+climate::ClimateTraits EverFrostZoneClimate::traits() { return everfrost_traits(); }
+
+void EverFrostZoneClimate::control(const climate::ClimateCall &call) {
+  auto target = call.get_target_temperature();
+  if (!target.has_value() || this->parent_ == nullptr)
+    return;
+  this->parent_->set_zone_target_temperature(2, *target);
+}
+
+void EverFrostZoneClimate::publish_current_temperature_value(float temperature_c) {
+  this->current_temperature = temperature_c;
+  this->publish_state();
+}
+
+void EverFrostZoneClimate::publish_target_temperature_value(float temperature_c) {
+  this->target_temperature = temperature_c;
+  this->publish_state();
+}
+
+void EverFrostZoneClimate::publish_disconnected() {
+  this->current_temperature = NAN;
+  this->target_temperature = NAN;
+  this->publish_state();
+}
+
+void EverFrostClimate::setup() {
+  this->mode = climate::CLIMATE_MODE_COOL;
+  this->action = climate::CLIMATE_ACTION_IDLE;
+
+  if (this->zone2_climate_ != nullptr) {
+    this->zone2_climate_->mode = climate::CLIMATE_MODE_COOL;
+    this->zone2_climate_->action = climate::CLIMATE_ACTION_IDLE;
+  }
+
+  if (this->connected_binary_sensor_ != nullptr)
+    this->connected_binary_sensor_->publish_initial_state(false);
+}
+
+void EverFrostClimate::dump_config() {
+  LOG_CLIMATE("", "Anker EverFrost", this);
+  ESP_LOGCONFIG(TAG, "  EverFrost 30 service UUID: 0x%08" PRIX32, SERVICE_UUID_30);
+  ESP_LOGCONFIG(TAG, "  EverFrost 50 service UUID: 0x%08" PRIX32, SERVICE_UUID_50);
+  ESP_LOGCONFIG(TAG, "  Write characteristic: 0x%04X", WRITE_CHAR_UUID);
+  ESP_LOGCONFIG(TAG, "  Notify characteristic: 0x%04X", NOTIFY_CHAR_UUID);
+  ESP_LOGCONFIG(TAG, "  Zone 2 climate configured: %s", YESNO(this->zone2_climate_ != nullptr));
+  ESP_LOGCONFIG(TAG, "  Raw packet logging: %s", YESNO(this->raw_packet_logging_));
+  LOG_UPDATE_INTERVAL(this);
+  LOG_SENSOR("  ", "Current Temperature Sensor", this->current_temperature_sensor_);
+  LOG_SENSOR("  ", "Battery Sensor", this->battery_sensor_);
+  LOG_BINARY_SENSOR("  ", "Connected", this->connected_binary_sensor_);
+}
+
+climate::ClimateTraits EverFrostClimate::traits() { return everfrost_traits(); }
+
 void EverFrostClimate::control(const climate::ClimateCall &call) {
   auto target = call.get_target_temperature();
   if (!target.has_value())
     return;
 
-  this->send_target_temperature_(*target);
+  this->send_target_temperature_(1, *target);
+}
+
+void EverFrostClimate::set_zone_target_temperature(uint8_t zone, float temperature_c) {
+  this->send_target_temperature_(zone, temperature_c);
 }
 
 void EverFrostClimate::update() { this->request_status(); }
@@ -83,9 +121,11 @@ void EverFrostClimate::write_packet_(const std::vector<uint8_t> &packet) {
 
   this->log_packet_("TX", packet.data(), packet.size());
 
+  const auto write_type = this->model_ == MODEL_50 ? ESP_GATT_WRITE_TYPE_NO_RSP
+                                                    : ESP_GATT_WRITE_TYPE_RSP;
   auto status = esp_ble_gattc_write_char(
       this->parent_->get_gattc_if(), this->parent_->get_conn_id(), this->write_handle_,
-      packet.size(), const_cast<uint8_t *>(packet.data()), ESP_GATT_WRITE_TYPE_RSP,
+      packet.size(), const_cast<uint8_t *>(packet.data()), write_type,
       ESP_GATT_AUTH_REQ_NONE);
 
   if (status != ESP_OK)
@@ -101,19 +141,60 @@ void EverFrostClimate::send_startup_request_() {
   this->write_packet_(packet);
 }
 
-void EverFrostClimate::send_target_temperature_(float temperature_c) {
-  // The protocol is Fahrenheit-based: encoded byte = whole degrees F + 128.
+void EverFrostClimate::send_zone_power_(uint8_t zone, bool enabled) {
+  if (this->model_ != MODEL_50)
+    return;
+
+  uint8_t command = 0;
+  if (zone == 1)
+    command = 0x86;
+  else if (zone == 2)
+    command = 0x87;
+  else
+    return;
+
+  std::vector<uint8_t> packet{
+      0x08, 0xEE, 0x00, 0x00, 0x00, 0x02, command, 0x0B, 0x00,
+      static_cast<uint8_t>(enabled ? 1 : 0),
+  };
+  packet.push_back(this->checksum_(packet.data(), packet.size()));
+  this->write_packet_(packet);
+}
+
+void EverFrostClimate::send_target_temperature_(uint8_t zone, float temperature_c) {
   int target_f = static_cast<int>(std::lround((temperature_c * 9.0f / 5.0f) + 32.0f));
   target_f = std::max(-20, std::min(68, target_f));
 
+  uint8_t command = 0x88;
+  if (this->model_ == MODEL_50) {
+    if (zone == 1)
+      command = 0x83;
+    else if (zone == 2)
+      command = 0x84;
+    else {
+      ESP_LOGW(TAG, "Invalid EverFrost 50 zone %u", zone);
+      return;
+    }
+
+    // The official app re-enables a zone before writing its target temperature.
+    this->send_zone_power_(zone, true);
+  } else if (zone != 1) {
+    ESP_LOGW(TAG, "Zone 2 is only available on a dual-zone EverFrost model");
+    return;
+  }
+
   std::vector<uint8_t> packet{
-      0x08, 0xEE, 0x00, 0x00, 0x00, 0x02, 0x88, 0x0B, 0x00,
+      0x08, 0xEE, 0x00, 0x00, 0x00, 0x02, command, 0x0B, 0x00,
       static_cast<uint8_t>(target_f + 128),
   };
   packet.push_back(this->checksum_(packet.data(), packet.size()));
 
-  this->pending_target_f_ = target_f;
-  ESP_LOGI(TAG, "Setting target temperature to %d°F (%.1f°C)", target_f,
+  if (zone == 1)
+    this->pending_target_f_ = target_f;
+  else
+    this->pending_zone2_target_f_ = target_f;
+
+  ESP_LOGI(TAG, "Setting Zone %u target temperature to %d°F (%.1f°C)", zone, target_f,
            (target_f - 32.0f) * 5.0f / 9.0f);
   this->write_packet_(packet);
 }
@@ -130,9 +211,23 @@ void EverFrostClimate::publish_target_temperature_(float temperature_c) {
   this->publish_state();
 }
 
+void EverFrostClimate::publish_zone2_current_temperature_(float temperature_c) {
+  if (this->zone2_climate_ != nullptr)
+    this->zone2_climate_->publish_current_temperature_value(temperature_c);
+}
+
+void EverFrostClimate::publish_zone2_target_temperature_(float temperature_c) {
+  if (this->zone2_climate_ != nullptr)
+    this->zone2_climate_->publish_target_temperature_value(temperature_c);
+}
+
 void EverFrostClimate::publish_battery_(uint8_t battery) {
   if (battery <= 100 && this->battery_sensor_ != nullptr)
     this->battery_sensor_->publish_state(battery);
+}
+
+void EverFrostClimate::schedule_status_refresh_() {
+  this->set_timeout("post_write_refresh", 500, [this]() { this->request_status(); });
 }
 
 void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
@@ -148,60 +243,151 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
     return;
   }
 
-  // Incoming packets observed so far begin 09 FF 00 00 01 01.
+  // Incoming packets observed so far begin 09 FF 00 00 01 xx.
   const uint8_t type = data[6];
+
+  // Command acknowledgements use 09 FF 00 00 01 02 CMD 0A 00 CS.
+  if (data[5] == 0x02) {
+    ESP_LOGD(TAG, "Command 0x%02X acknowledgement received", type);
+    this->schedule_status_refresh_();
+    return;
+  }
 
   switch (type) {
     case 0x01: {
-      // Full 54-byte status response.
       if (length < 54) {
         ESP_LOGW(TAG, "Full-status packet was only %u bytes", length);
         return;
       }
 
-      // Provisional: byte 13 has matched the cooler's displayed battery percentage.
       const uint8_t battery = data[13];
-      const int current_f = static_cast<int>(data[17]) - 128;
-      const int target_f = static_cast<int>(data[18]) - 128;
-      const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
-      const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
-
-      ESP_LOGI(TAG, "Status: current=%d°F, target=%d°F, battery=%u%%",
-               current_f, target_f, battery);
-
       this->publish_battery_(battery);
-      this->publish_current_temperature_(current_c);
-      this->publish_target_temperature_(target_c);
 
-      if (this->pending_target_f_ != -999 && target_f == this->pending_target_f_) {
-        ESP_LOGI(TAG, "Target-temperature change confirmed at %d°F", target_f);
-        this->pending_target_f_ = -999;
+      if (this->model_ == MODEL_50) {
+        // EverFrost 50 full-status packet observed from the official app:
+        // Zone 1 current/target at bytes 20/21, Zone 2 current/target at 23/24.
+        const int zone1_current_f = static_cast<int>(data[20]) - 128;
+        const int zone1_target_f = static_cast<int>(data[21]) - 128;
+        const int zone2_current_f = static_cast<int>(data[23]) - 128;
+        const int zone2_target_f = static_cast<int>(data[24]) - 128;
+
+        const float zone1_current_c = (zone1_current_f - 32.0f) * 5.0f / 9.0f;
+        const float zone1_target_c = (zone1_target_f - 32.0f) * 5.0f / 9.0f;
+        const float zone2_current_c = (zone2_current_f - 32.0f) * 5.0f / 9.0f;
+        const float zone2_target_c = (zone2_target_f - 32.0f) * 5.0f / 9.0f;
+
+        ESP_LOGI(TAG,
+                 "Status 50: Z1 current=%d°F target=%d°F, Z2 current=%d°F target=%d°F, battery=%u%%",
+                 zone1_current_f, zone1_target_f, zone2_current_f, zone2_target_f, battery);
+
+        this->publish_current_temperature_(zone1_current_c);
+        this->publish_target_temperature_(zone1_target_c);
+        this->publish_zone2_current_temperature_(zone2_current_c);
+        this->publish_zone2_target_temperature_(zone2_target_c);
+
+        if (this->pending_target_f_ != -999 && zone1_target_f == this->pending_target_f_) {
+          ESP_LOGI(TAG, "Zone 1 target-temperature change confirmed at %d°F", zone1_target_f);
+          this->pending_target_f_ = -999;
+        }
+        if (this->pending_zone2_target_f_ != -999 && zone2_target_f == this->pending_zone2_target_f_) {
+          ESP_LOGI(TAG, "Zone 2 target-temperature change confirmed at %d°F", zone2_target_f);
+          this->pending_zone2_target_f_ = -999;
+        }
+      } else {
+        const int current_f = static_cast<int>(data[17]) - 128;
+        const int target_f = static_cast<int>(data[18]) - 128;
+        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+
+        ESP_LOGI(TAG, "Status 30: current=%d°F, target=%d°F, battery=%u%%",
+                 current_f, target_f, battery);
+
+        this->publish_current_temperature_(current_c);
+        this->publish_target_temperature_(target_c);
+
+        if (this->pending_target_f_ != -999 && target_f == this->pending_target_f_) {
+          ESP_LOGI(TAG, "Target-temperature change confirmed at %d°F", target_f);
+          this->pending_target_f_ = -999;
+        }
+      }
+      break;
+    }
+
+    case 0x04: {
+      if (this->model_ == MODEL_50) {
+        const uint8_t battery = data[9];
+        ESP_LOGD(TAG, "Battery notification: %u%%", battery);
+        this->publish_battery_(battery);
       }
       break;
     }
 
     case 0x05: {
-      // Current-temperature notification.
-      const int current_f = static_cast<int>(data[9]) - 128;
-      const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
-      ESP_LOGD(TAG, "Current temperature notification: %d°F", current_f);
-      this->publish_current_temperature_(current_c);
+      if (this->model_ == MODEL_30) {
+        const int current_f = static_cast<int>(data[9]) - 128;
+        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+        ESP_LOGD(TAG, "Current temperature notification: %d°F", current_f);
+        this->publish_current_temperature_(current_c);
+      }
+      break;
+    }
+
+    case 0x06: {
+      if (this->model_ == MODEL_50) {
+        const int current_f = static_cast<int>(data[9]) - 128;
+        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+        ESP_LOGD(TAG, "Zone 1 current temperature notification: %d°F", current_f);
+        this->publish_current_temperature_(current_c);
+      }
+      break;
+    }
+
+    case 0x07: {
+      if (this->model_ == MODEL_50) {
+        const int current_f = static_cast<int>(data[9]) - 128;
+        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+        ESP_LOGD(TAG, "Zone 2 current temperature notification: %d°F", current_f);
+        this->publish_zone2_current_temperature_(current_c);
+      }
       break;
     }
 
     case 0x0B: {
-      // Target-temperature notification.
-      const int target_f = static_cast<int>(data[9]) - 128;
-      const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
-      ESP_LOGD(TAG, "Target temperature notification: %d°F", target_f);
-      this->publish_target_temperature_(target_c);
+      if (this->model_ == MODEL_30) {
+        const int target_f = static_cast<int>(data[9]) - 128;
+        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+        ESP_LOGD(TAG, "Target temperature notification: %d°F", target_f);
+        this->publish_target_temperature_(target_c);
+      }
       break;
     }
 
-    case 0x88:
-      ESP_LOGD(TAG, "Command acknowledgement received");
-      // Ask for authoritative state after a successful write.
-      this->set_timeout("post_write_refresh", 500, [this]() { this->request_status(); });
+    case 0x0C: {
+      if (this->model_ == MODEL_50) {
+        const int target_f = static_cast<int>(data[9]) - 128;
+        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+        ESP_LOGD(TAG, "Zone 1 target temperature notification: %d°F", target_f);
+        this->publish_target_temperature_(target_c);
+        if (this->pending_target_f_ == target_f)
+          this->pending_target_f_ = -999;
+      }
+      break;
+    }
+
+    case 0x0D: {
+      if (this->model_ == MODEL_50) {
+        const int target_f = static_cast<int>(data[9]) - 128;
+        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+        ESP_LOGD(TAG, "Zone 2 target temperature notification: %d°F", target_f);
+        this->publish_zone2_target_temperature_(target_c);
+        if (this->pending_zone2_target_f_ == target_f)
+          this->pending_zone2_target_f_ = -999;
+      }
+      break;
+    }
+
+    case 0x02:
+      ESP_LOGD(TAG, "Unknown telemetry 0x02 value=%u", data[9]);
       break;
 
     case 0x03:
@@ -244,26 +430,44 @@ void EverFrostClimate::gattc_event_handler(esp_gattc_cb_event_t event,
       this->ready_ = false;
       this->write_handle_ = 0;
       this->notify_handle_ = 0;
+      this->model_ = MODEL_UNKNOWN;
       this->current_temperature = NAN;
       this->target_temperature = NAN;
       this->publish_state();
+      if (this->zone2_climate_ != nullptr)
+        this->zone2_climate_->publish_disconnected();
       if (this->connected_binary_sensor_ != nullptr)
         this->connected_binary_sensor_->publish_state(false);
       ESP_LOGW(TAG, "EverFrost disconnected");
       break;
 
     case ESP_GATTC_SEARCH_CMPL_EVT: {
-      const auto service_uuid = espbt::ESPBTUUID::from_uint32(SERVICE_UUID);
       const auto write_uuid = espbt::ESPBTUUID::from_uint16(WRITE_CHAR_UUID);
       const auto notify_uuid = espbt::ESPBTUUID::from_uint16(NOTIFY_CHAR_UUID);
 
+      auto service_uuid = espbt::ESPBTUUID::from_uint32(SERVICE_UUID_30);
       auto *write_chr = this->parent_->get_characteristic(service_uuid, write_uuid);
       auto *notify_chr = this->parent_->get_characteristic(service_uuid, notify_uuid);
 
-      if (write_chr == nullptr || notify_chr == nullptr) {
+      if (write_chr != nullptr && notify_chr != nullptr) {
+        this->model_ = MODEL_30;
+      } else {
+        service_uuid = espbt::ESPBTUUID::from_uint32(SERVICE_UUID_50);
+        write_chr = this->parent_->get_characteristic(service_uuid, write_uuid);
+        notify_chr = this->parent_->get_characteristic(service_uuid, notify_uuid);
+        if (write_chr != nullptr && notify_chr != nullptr)
+          this->model_ = MODEL_50;
+      }
+
+      if (write_chr == nullptr || notify_chr == nullptr || this->model_ == MODEL_UNKNOWN) {
         ESP_LOGE(TAG, "Required EverFrost BLE characteristics were not found");
         return;
       }
+
+      if (this->model_ == MODEL_50 && this->zone2_climate_ == nullptr)
+        ESP_LOGW(TAG, "EverFrost 50 detected but no zone_2 climate is configured");
+
+      ESP_LOGI(TAG, "Detected EverFrost %s BLE protocol", this->model_ == MODEL_50 ? "50" : "30");
 
       this->write_handle_ = write_chr->handle;
       this->notify_handle_ = notify_chr->handle;
