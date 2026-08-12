@@ -73,6 +73,14 @@ binary_sensor:
     connected:
       name: "EverFrost 50 Connected"
 
+select:
+  - platform: everfrost
+    everfrost_id: everfrost_50
+    voltage_protection:
+      name: "EverFrost 50 Voltage Protection"
+    screen_brightness:
+      name: "EverFrost 50 Screen Brightness"
+
 button:
   - platform: everfrost
     everfrost_id: everfrost_30
