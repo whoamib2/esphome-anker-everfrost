@@ -6,7 +6,7 @@ from esphome.const import CONF_ID
 from .const import CONF_RAW_PACKET_LOGGING, CONF_ZONE_2
 
 DEPENDENCIES = ["ble_client"]
-AUTO_LOAD = ["sensor", "binary_sensor", "button"]
+AUTO_LOAD = ["sensor", "binary_sensor", "button", "select"]
 
 everfrost_ns = cg.esphome_ns.namespace("everfrost")
 EverFrostClimate = everfrost_ns.class_(
