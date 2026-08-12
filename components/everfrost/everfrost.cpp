@@ -13,9 +13,12 @@ namespace everfrost {
 
 static const char *const TAG = "everfrost";
 
-static climate::ClimateTraits everfrost_traits() {
+static climate::ClimateTraits everfrost_traits(bool supports_off) {
   auto traits = climate::ClimateTraits();
-  traits.set_supported_modes({climate::CLIMATE_MODE_COOL});
+  if (supports_off)
+    traits.set_supported_modes({climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_COOL});
+  else
+    traits.set_supported_modes({climate::CLIMATE_MODE_COOL});
   traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
   traits.set_visual_min_temperature(-20.0f);
   traits.set_visual_max_temperature(20.0f);
@@ -23,13 +26,25 @@ static climate::ClimateTraits everfrost_traits() {
   return traits;
 }
 
-climate::ClimateTraits EverFrostZoneClimate::traits() { return everfrost_traits(); }
+climate::ClimateTraits EverFrostZoneClimate::traits() { return everfrost_traits(true); }
 
 void EverFrostZoneClimate::control(const climate::ClimateCall &call) {
-  auto target = call.get_target_temperature();
-  if (!target.has_value() || this->parent_ == nullptr)
+  if (this->parent_ == nullptr)
     return;
-  this->parent_->set_zone_target_temperature(2, *target);
+
+  auto mode = call.get_mode();
+  if (mode.has_value()) {
+    if (*mode == climate::CLIMATE_MODE_OFF) {
+      this->parent_->set_zone_power(2, false);
+      return;
+    }
+    if (*mode == climate::CLIMATE_MODE_COOL)
+      this->parent_->set_zone_power(2, true);
+  }
+
+  auto target = call.get_target_temperature();
+  if (target.has_value())
+    this->parent_->set_zone_target_temperature(2, *target);
 }
 
 void EverFrostZoneClimate::publish_current_temperature_value(float temperature_c) {
@@ -40,6 +55,26 @@ void EverFrostZoneClimate::publish_current_temperature_value(float temperature_c
 void EverFrostZoneClimate::publish_target_temperature_value(float temperature_c) {
   this->target_temperature = temperature_c;
   this->publish_state();
+}
+
+void EverFrostZoneClimate::publish_power_value(bool enabled) {
+  this->mode = enabled ? climate::CLIMATE_MODE_COOL : climate::CLIMATE_MODE_OFF;
+  this->action = enabled ? climate::CLIMATE_ACTION_IDLE : climate::CLIMATE_ACTION_OFF;
+  this->publish_state();
+}
+
+void EverFrostVoltageProtectionSelect::control(size_t index) {
+  if (this->parent_ == nullptr || index > 2)
+    return;
+  this->parent_->set_voltage_protection(static_cast<uint8_t>(index));
+  this->publish_state(index);
+}
+
+void EverFrostScreenBrightnessSelect::control(size_t index) {
+  if (this->parent_ == nullptr || index > 2)
+    return;
+  this->parent_->set_screen_brightness(static_cast<uint8_t>(index));
+  this->publish_state(index);
 }
 
 void EverFrostZoneClimate::publish_disconnected() {
@@ -75,18 +110,44 @@ void EverFrostClimate::dump_config() {
   LOG_BINARY_SENSOR("  ", "Connected", this->connected_binary_sensor_);
 }
 
-climate::ClimateTraits EverFrostClimate::traits() { return everfrost_traits(); }
+climate::ClimateTraits EverFrostClimate::traits() {
+  return everfrost_traits(this->zone2_climate_ != nullptr);
+}
 
 void EverFrostClimate::control(const climate::ClimateCall &call) {
-  auto target = call.get_target_temperature();
-  if (!target.has_value())
-    return;
+  auto mode = call.get_mode();
+  if (mode.has_value() && this->zone2_climate_ != nullptr) {
+    if (*mode == climate::CLIMATE_MODE_OFF) {
+      this->set_zone_power(1, false);
+      return;
+    }
+    if (*mode == climate::CLIMATE_MODE_COOL)
+      this->set_zone_power(1, true);
+  }
 
-  this->send_target_temperature_(1, *target);
+  auto target = call.get_target_temperature();
+  if (target.has_value())
+    this->send_target_temperature_(1, *target);
 }
 
 void EverFrostClimate::set_zone_target_temperature(uint8_t zone, float temperature_c) {
   this->send_target_temperature_(zone, temperature_c);
+}
+
+void EverFrostClimate::set_zone_power(uint8_t zone, bool enabled) {
+  this->send_zone_power_(zone, enabled);
+}
+
+void EverFrostClimate::set_voltage_protection(uint8_t level) {
+  if (level > 2)
+    return;
+  this->send_setting_(0x85, level);
+}
+
+void EverFrostClimate::set_screen_brightness(uint8_t level) {
+  if (level > 2)
+    return;
+  this->send_setting_(0x81, level);
 }
 
 void EverFrostClimate::update() { this->request_status(); }
@@ -159,6 +220,20 @@ void EverFrostClimate::send_zone_power_(uint8_t zone, bool enabled) {
   };
   packet.push_back(this->checksum_(packet.data(), packet.size()));
   this->write_packet_(packet);
+  this->publish_zone_power_(zone, enabled);
+}
+
+void EverFrostClimate::send_setting_(uint8_t command, uint8_t value) {
+  if (this->model_ != MODEL_50) {
+    ESP_LOGW(TAG, "EverFrost setting command 0x%02X is only supported on the 50L protocol", command);
+    return;
+  }
+
+  std::vector<uint8_t> packet{
+      0x08, 0xEE, 0x00, 0x00, 0x00, 0x02, command, 0x0B, 0x00, value,
+  };
+  packet.push_back(this->checksum_(packet.data(), packet.size()));
+  this->write_packet_(packet);
 }
 
 void EverFrostClimate::send_target_temperature_(uint8_t zone, float temperature_c) {
@@ -221,9 +296,29 @@ void EverFrostClimate::publish_zone2_target_temperature_(float temperature_c) {
     this->zone2_climate_->publish_target_temperature_value(temperature_c);
 }
 
+void EverFrostClimate::publish_zone_power_(uint8_t zone, bool enabled) {
+  if (zone == 1) {
+    this->mode = enabled ? climate::CLIMATE_MODE_COOL : climate::CLIMATE_MODE_OFF;
+    this->action = enabled ? climate::CLIMATE_ACTION_IDLE : climate::CLIMATE_ACTION_OFF;
+    this->publish_state();
+  } else if (zone == 2 && this->zone2_climate_ != nullptr) {
+    this->zone2_climate_->publish_power_value(enabled);
+  }
+}
+
 void EverFrostClimate::publish_battery_(uint8_t battery) {
   if (battery <= 100 && this->battery_sensor_ != nullptr)
     this->battery_sensor_->publish_state(battery);
+}
+
+void EverFrostClimate::publish_voltage_protection_(uint8_t level) {
+  if (level <= 2 && this->voltage_protection_select_ != nullptr)
+    this->voltage_protection_select_->publish_state(level);
+}
+
+void EverFrostClimate::publish_screen_brightness_(uint8_t level) {
+  if (level <= 2 && this->screen_brightness_select_ != nullptr)
+    this->screen_brightness_select_->publish_state(level);
 }
 
 void EverFrostClimate::schedule_status_refresh_() {
@@ -266,6 +361,10 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
       if (this->model_ == MODEL_50) {
         // EverFrost 50 full-status packet observed from the official app:
         // Zone 1 current/target at bytes 20/21, Zone 2 current/target at 23/24.
+        const bool zone1_enabled = data[14] != 0;
+        const bool zone2_enabled = data[15] != 0;
+        const uint8_t screen_brightness = data[16];
+        const uint8_t voltage_protection = data[19];
         const int zone1_current_f = static_cast<int>(data[20]) - 128;
         const int zone1_target_f = static_cast<int>(data[21]) - 128;
         const int zone2_current_f = static_cast<int>(data[23]) - 128;
@@ -277,9 +376,15 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
         const float zone2_target_c = (zone2_target_f - 32.0f) * 5.0f / 9.0f;
 
         ESP_LOGI(TAG,
-                 "Status 50: Z1 current=%d°F target=%d°F, Z2 current=%d°F target=%d°F, battery=%u%%",
-                 zone1_current_f, zone1_target_f, zone2_current_f, zone2_target_f, battery);
+                 "Status 50: Z1 %s current=%d°F target=%d°F, Z2 %s current=%d°F target=%d°F, battery=%u%%, brightness=%u, voltage=%u",
+                 zone1_enabled ? "on" : "off", zone1_current_f, zone1_target_f,
+                 zone2_enabled ? "on" : "off", zone2_current_f, zone2_target_f, battery,
+                 screen_brightness, voltage_protection);
 
+        this->publish_zone_power_(1, zone1_enabled);
+        this->publish_zone_power_(2, zone2_enabled);
+        this->publish_screen_brightness_(screen_brightness);
+        this->publish_voltage_protection_(voltage_protection);
         this->publish_current_temperature_(zone1_current_c);
         this->publish_target_temperature_(zone1_target_c);
         this->publish_zone2_current_temperature_(zone2_current_c);
