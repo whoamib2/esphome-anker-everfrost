@@ -1,0 +1,85 @@
+# Example: one ESP32 connected permanently to an EverFrost 30 and an EverFrost 50.
+# Merge the relevant sections into your existing ESPHome configuration.
+
+esp32_ble:
+  max_connections: 5
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 3
+
+ble_client:
+  - mac_address: E8:EE:CC:74:94:10
+    id: everfrost_30_ble
+    auto_connect: true
+
+  - mac_address: E8:EE:CC:EF:69:89
+    id: everfrost_50_ble
+    auto_connect: true
+
+climate:
+  - platform: everfrost
+    id: everfrost_30
+    name: "EverFrost 30"
+    ble_client_id: everfrost_30_ble
+    update_interval: 60s
+    raw_packet_logging: true
+
+  - platform: everfrost
+    id: everfrost_50
+    name: "EverFrost 50 Zone 1"
+    ble_client_id: everfrost_50_ble
+    update_interval: 60s
+    raw_packet_logging: true
+    zone_2:
+      id: everfrost_50_zone_2
+      name: "EverFrost 50 Zone 2"
+
+sensor:
+  - platform: everfrost
+    everfrost_id: everfrost_30
+    current_temperature:
+      name: "EverFrost 30 Current Temperature"
+    battery:
+      name: "EverFrost 30 Battery"
+
+  - platform: ble_client
+    type: rssi
+    ble_client_id: everfrost_30_ble
+    name: "EverFrost 30 BLE RSSI"
+    entity_category: diagnostic
+
+  - platform: everfrost
+    everfrost_id: everfrost_50
+    current_temperature:
+      name: "EverFrost 50 Zone 1 Current Temperature"
+    battery:
+      name: "EverFrost 50 Battery"
+
+  - platform: ble_client
+    type: rssi
+    ble_client_id: everfrost_50_ble
+    name: "EverFrost 50 BLE RSSI"
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: everfrost
+    everfrost_id: everfrost_30
+    connected:
+      name: "EverFrost 30 Connected"
+
+  - platform: everfrost
+    everfrost_id: everfrost_50
+    connected:
+      name: "EverFrost 50 Connected"
+
+button:
+  - platform: everfrost
+    everfrost_id: everfrost_30
+    refresh:
+      name: "EverFrost 30 Refresh Status"
+
+  - platform: everfrost
+    everfrost_id: everfrost_50
+    refresh:
+      name: "EverFrost 50 Refresh Status"
