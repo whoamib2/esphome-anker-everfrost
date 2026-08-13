@@ -143,6 +143,7 @@ void EverFrostClimate::set_zone_power(uint8_t zone, bool enabled) {
 void EverFrostClimate::set_voltage_protection(uint8_t level) {
   if (level > 2)
     return;
+  ESP_LOGI(TAG, "Setting voltage protection level to %u", level);
   this->send_setting_(0x85, level);
 }
 
@@ -369,9 +370,13 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
         this->publish_battery_(battery);
 
         if (this->model_ == MODEL_50) {
-          // Confirmed EverFrost 50 full-status layout.
+          // Confirmed EverFrost 50 full-status fields. Byte 19 was initially
+          // believed to be voltage protection because it matched one capture,
+          // but repeated testing shows it stays at 1 even when command 0x85
+          // changes the cooler. Keep it diagnostic only and do not use it to
+          // overwrite the Home Assistant voltage-protection selection.
           const uint8_t screen_brightness = frame[16];
-          const uint8_t voltage_protection = frame[19];
+          const uint8_t status_byte_19 = frame[19];
           const int zone1_current_f = static_cast<int>(frame[20]) - 128;
           const int zone1_target_f = static_cast<int>(frame[21]) - 128;
           const bool zone1_enabled = frame[22] != 0;
@@ -386,15 +391,14 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
 
           ESP_LOGI(TAG,
                    "Status 50: Z1 %s current=%d°F target=%d°F, Z2 %s current=%d°F target=%d°F, "
-                   "battery=%u%%, brightness=%u, voltage=%u",
+                   "battery=%u%%, brightness=%u, status19=%u",
                    zone1_enabled ? "on" : "off", zone1_current_f, zone1_target_f,
                    zone2_enabled ? "on" : "off", zone2_current_f, zone2_target_f,
-                   battery, screen_brightness, voltage_protection);
+                   battery, screen_brightness, status_byte_19);
 
           this->publish_zone_power_(1, zone1_enabled);
           this->publish_zone_power_(2, zone2_enabled);
           this->publish_screen_brightness_(screen_brightness);
-          this->publish_voltage_protection_(voltage_protection);
           this->publish_current_temperature_(zone1_current_c);
           this->publish_target_temperature_(zone1_target_c);
           this->publish_zone2_current_temperature_(zone2_current_c);
