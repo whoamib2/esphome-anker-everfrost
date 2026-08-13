@@ -203,23 +203,34 @@ void EverFrostClimate::send_startup_request_() {
 }
 
 void EverFrostClimate::send_zone_power_(uint8_t zone, bool enabled) {
-  if (this->model_ != MODEL_50)
+  if (this->model_ != MODEL_50) {
+    ESP_LOGW(TAG, "Zone power control is only supported on the EverFrost 50 protocol");
     return;
+  }
 
   uint8_t command = 0;
   if (zone == 1)
     command = 0x86;
   else if (zone == 2)
     command = 0x87;
-  else
+  else {
+    ESP_LOGW(TAG, "Invalid EverFrost 50 zone %u", zone);
     return;
+  }
 
   std::vector<uint8_t> packet{
       0x08, 0xEE, 0x00, 0x00, 0x00, 0x02, command, 0x0B, 0x00,
       static_cast<uint8_t>(enabled ? 1 : 0),
   };
   packet.push_back(this->checksum_(packet.data(), packet.size()));
+
+  ESP_LOGI(TAG, "Setting Zone %u power %s", zone, enabled ? "ON" : "OFF");
   this->write_packet_(packet);
+
+  // The 50L sends an acknowledgement for 0x86/0x87 but the captured protocol
+  // does not provide a reliable independent power-state notification.
+  // Keep HA synchronized with the command we actually sent instead of letting
+  // an unrelated/stale full-status field overwrite the climate mode.
   this->publish_zone_power_(zone, enabled);
 }
 
@@ -251,8 +262,9 @@ void EverFrostClimate::send_target_temperature_(uint8_t zone, float temperature_
       return;
     }
 
-    // The official app re-enables a zone before writing its target temperature.
-    this->send_zone_power_(zone, true);
+    // Do not implicitly force a zone back ON from a temperature-only update.
+    // HA mode control is authoritative for power. If a ClimateCall includes
+    // COOL and a target, control() sends ON first and then sends the target.
   } else if (zone != 1) {
     ESP_LOGW(TAG, "Zone 2 is only available on a dual-zone EverFrost model");
     return;
@@ -338,13 +350,18 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
     return;
   }
 
-  // Incoming packets observed so far begin 09 FF 00 00 01 xx.
   const uint8_t type = data[6];
 
   // Command acknowledgements use 09 FF 00 00 01 02 CMD 0A 00 CS.
   if (data[5] == 0x02) {
     ESP_LOGD(TAG, "Command 0x%02X acknowledgement received", type);
-    this->schedule_status_refresh_();
+
+    // The 50L power ACK confirms receipt of the command but carries no ON/OFF
+    // value. Do not issue an immediate status refresh for power changes; the
+    // full-status power bytes have not been verified after a zone transition
+    // and were causing HA to jump back to COOL while the cooler was OFF.
+    if (type != 0x86 && type != 0x87)
+      this->schedule_status_refresh_();
     return;
   }
 
@@ -359,10 +376,9 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
       this->publish_battery_(battery);
 
       if (this->model_ == MODEL_50) {
-        // EverFrost 50 full-status packet observed from the official app:
-        // Zone 1 current/target at bytes 20/21, Zone 2 current/target at 23/24.
-        const bool zone1_enabled = data[14] != 0;
-        const bool zone2_enabled = data[15] != 0;
+        // Confirmed 50L fields from the captured full-status packet.
+        // Power state is intentionally NOT taken from bytes 14/15 until we
+        // capture a full-status packet immediately after a zone power change.
         const uint8_t screen_brightness = data[16];
         const uint8_t voltage_protection = data[19];
         const int zone1_current_f = static_cast<int>(data[20]) - 128;
@@ -376,13 +392,11 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
         const float zone2_target_c = (zone2_target_f - 32.0f) * 5.0f / 9.0f;
 
         ESP_LOGI(TAG,
-                 "Status 50: Z1 %s current=%d°F target=%d°F, Z2 %s current=%d°F target=%d°F, battery=%u%%, brightness=%u, voltage=%u",
-                 zone1_enabled ? "on" : "off", zone1_current_f, zone1_target_f,
-                 zone2_enabled ? "on" : "off", zone2_current_f, zone2_target_f, battery,
-                 screen_brightness, voltage_protection);
+                 "Status 50: Z1 current=%d°F target=%d°F, Z2 current=%d°F target=%d°F, "
+                 "battery=%u%%, brightness=%u, voltage=%u",
+                 zone1_current_f, zone1_target_f, zone2_current_f, zone2_target_f,
+                 battery, screen_brightness, voltage_protection);
 
-        this->publish_zone_power_(1, zone1_enabled);
-        this->publish_zone_power_(2, zone2_enabled);
         this->publish_screen_brightness_(screen_brightness);
         this->publish_voltage_protection_(voltage_protection);
         this->publish_current_temperature_(zone1_current_c);
@@ -394,7 +408,8 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
           ESP_LOGI(TAG, "Zone 1 target-temperature change confirmed at %d°F", zone1_target_f);
           this->pending_target_f_ = -999;
         }
-        if (this->pending_zone2_target_f_ != -999 && zone2_target_f == this->pending_zone2_target_f_) {
+        if (this->pending_zone2_target_f_ != -999 &&
+            zone2_target_f == this->pending_zone2_target_f_) {
           ESP_LOGI(TAG, "Zone 2 target-temperature change confirmed at %d°F", zone2_target_f);
           this->pending_zone2_target_f_ = -999;
         }
@@ -572,7 +587,8 @@ void EverFrostClimate::gattc_event_handler(esp_gattc_cb_event_t event,
       if (this->model_ == MODEL_50 && this->zone2_climate_ == nullptr)
         ESP_LOGW(TAG, "EverFrost 50 detected but no zone_2 climate is configured");
 
-      ESP_LOGI(TAG, "Detected EverFrost %s BLE protocol", this->model_ == MODEL_50 ? "50" : "30");
+      ESP_LOGI(TAG, "Detected EverFrost %s BLE protocol",
+               this->model_ == MODEL_50 ? "50" : "30");
 
       this->write_handle_ = write_chr->handle;
       this->notify_handle_ = notify_chr->handle;
