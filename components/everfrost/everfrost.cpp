@@ -63,6 +63,12 @@ void EverFrostZoneClimate::publish_power_value(bool enabled) {
   this->publish_state();
 }
 
+void EverFrostZoneClimate::publish_disconnected() {
+  this->current_temperature = NAN;
+  this->target_temperature = NAN;
+  this->publish_state();
+}
+
 void EverFrostVoltageProtectionSelect::control(size_t index) {
   if (this->parent_ == nullptr || index > 2)
     return;
@@ -75,12 +81,6 @@ void EverFrostScreenBrightnessSelect::control(size_t index) {
     return;
   this->parent_->set_screen_brightness(static_cast<uint8_t>(index));
   this->publish_state(index);
-}
-
-void EverFrostZoneClimate::publish_disconnected() {
-  this->current_temperature = NAN;
-  this->target_temperature = NAN;
-  this->publish_state();
 }
 
 void EverFrostClimate::setup() {
@@ -111,6 +111,8 @@ void EverFrostClimate::dump_config() {
 }
 
 climate::ClimateTraits EverFrostClimate::traits() {
+  // The 30L has no independent cooling-off command; its climate remains COOL-only.
+  // A configured Zone 2 identifies the 50L setup and enables OFF/COOL for Zone 1.
   return everfrost_traits(this->zone2_climate_ != nullptr);
 }
 
@@ -227,10 +229,8 @@ void EverFrostClimate::send_zone_power_(uint8_t zone, bool enabled) {
   ESP_LOGI(TAG, "Setting Zone %u power %s", zone, enabled ? "ON" : "OFF");
   this->write_packet_(packet);
 
-  // The 50L sends an acknowledgement for 0x86/0x87 but the captured protocol
-  // does not provide a reliable independent power-state notification.
-  // Keep HA synchronized with the command we actually sent instead of letting
-  // an unrelated/stale full-status field overwrite the climate mode.
+  // Publish immediately for responsive HA controls. The command ACK schedules a
+  // status refresh, which then confirms the real physical zone state.
   this->publish_zone_power_(zone, enabled);
 }
 
@@ -262,9 +262,7 @@ void EverFrostClimate::send_target_temperature_(uint8_t zone, float temperature_
       return;
     }
 
-    // Do not implicitly force a zone back ON from a temperature-only update.
-    // HA mode control is authoritative for power. If a ClimateCall includes
-    // COOL and a target, control() sends ON first and then sends the target.
+    // A temperature-only update does not implicitly change zone power.
   } else if (zone != 1) {
     ESP_LOGW(TAG, "Zone 2 is only available on a dual-zone EverFrost model");
     return;
@@ -340,187 +338,219 @@ void EverFrostClimate::schedule_status_refresh_() {
 void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
   this->log_packet_("RX", data, length);
 
-  if (length < 10) {
-    ESP_LOGW(TAG, "Ignoring short packet (%u bytes)", length);
-    return;
-  }
+  auto parse_frame = [this](const uint8_t *frame, uint16_t frame_length) {
+    if (frame_length < 10) {
+      ESP_LOGW(TAG, "Ignoring short EverFrost frame (%u bytes)", frame_length);
+      return;
+    }
 
-  if (!this->validate_checksum_(data, length)) {
-    ESP_LOGW(TAG, "Ignoring packet with invalid checksum");
-    return;
-  }
+    if (!this->validate_checksum_(frame, frame_length)) {
+      ESP_LOGW(TAG, "Ignoring EverFrost frame with invalid checksum");
+      return;
+    }
 
-  const uint8_t type = data[6];
+    const uint8_t type = frame[6];
 
-  // Command acknowledgements use 09 FF 00 00 01 02 CMD 0A 00 CS.
-  if (data[5] == 0x02) {
-    ESP_LOGD(TAG, "Command 0x%02X acknowledgement received", type);
-
-    // The 50L power ACK confirms receipt of the command but carries no ON/OFF
-    // value. Do not issue an immediate status refresh for power changes; the
-    // full-status power bytes have not been verified after a zone transition
-    // and were causing HA to jump back to COOL while the cooler was OFF.
-    if (type != 0x86 && type != 0x87)
+    // Command acknowledgements use 09 FF 00 00 01 02 CMD 0A 00 CS.
+    if (frame[5] == 0x02) {
+      ESP_LOGD(TAG, "Command 0x%02X acknowledgement received", type);
       this->schedule_status_refresh_();
-    return;
-  }
+      return;
+    }
 
-  switch (type) {
-    case 0x01: {
-      if (length < 54) {
-        ESP_LOGW(TAG, "Full-status packet was only %u bytes", length);
+    switch (type) {
+      case 0x01: {
+        if (frame_length < 54) {
+          ESP_LOGW(TAG, "Full-status packet was only %u bytes", frame_length);
+          return;
+        }
+
+        const uint8_t battery = frame[13];
+        this->publish_battery_(battery);
+
+        if (this->model_ == MODEL_50) {
+          // Confirmed EverFrost 50 full-status layout.
+          const uint8_t screen_brightness = frame[16];
+          const uint8_t voltage_protection = frame[19];
+          const int zone1_current_f = static_cast<int>(frame[20]) - 128;
+          const int zone1_target_f = static_cast<int>(frame[21]) - 128;
+          const bool zone1_enabled = frame[22] != 0;
+          const int zone2_current_f = static_cast<int>(frame[23]) - 128;
+          const int zone2_target_f = static_cast<int>(frame[24]) - 128;
+          const bool zone2_enabled = frame[25] != 0;
+
+          const float zone1_current_c = (zone1_current_f - 32.0f) * 5.0f / 9.0f;
+          const float zone1_target_c = (zone1_target_f - 32.0f) * 5.0f / 9.0f;
+          const float zone2_current_c = (zone2_current_f - 32.0f) * 5.0f / 9.0f;
+          const float zone2_target_c = (zone2_target_f - 32.0f) * 5.0f / 9.0f;
+
+          ESP_LOGI(TAG,
+                   "Status 50: Z1 %s current=%d°F target=%d°F, Z2 %s current=%d°F target=%d°F, "
+                   "battery=%u%%, brightness=%u, voltage=%u",
+                   zone1_enabled ? "on" : "off", zone1_current_f, zone1_target_f,
+                   zone2_enabled ? "on" : "off", zone2_current_f, zone2_target_f,
+                   battery, screen_brightness, voltage_protection);
+
+          this->publish_zone_power_(1, zone1_enabled);
+          this->publish_zone_power_(2, zone2_enabled);
+          this->publish_screen_brightness_(screen_brightness);
+          this->publish_voltage_protection_(voltage_protection);
+          this->publish_current_temperature_(zone1_current_c);
+          this->publish_target_temperature_(zone1_target_c);
+          this->publish_zone2_current_temperature_(zone2_current_c);
+          this->publish_zone2_target_temperature_(zone2_target_c);
+
+          if (this->pending_target_f_ != -999 && zone1_target_f == this->pending_target_f_) {
+            ESP_LOGI(TAG, "Zone 1 target-temperature change confirmed at %d°F", zone1_target_f);
+            this->pending_target_f_ = -999;
+          }
+          if (this->pending_zone2_target_f_ != -999 &&
+              zone2_target_f == this->pending_zone2_target_f_) {
+            ESP_LOGI(TAG, "Zone 2 target-temperature change confirmed at %d°F", zone2_target_f);
+            this->pending_zone2_target_f_ = -999;
+          }
+        } else {
+          const int current_f = static_cast<int>(frame[17]) - 128;
+          const int target_f = static_cast<int>(frame[18]) - 128;
+          const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+          const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+
+          ESP_LOGI(TAG, "Status 30: current=%d°F, target=%d°F, battery=%u%%",
+                   current_f, target_f, battery);
+
+          this->publish_current_temperature_(current_c);
+          this->publish_target_temperature_(target_c);
+
+          if (this->pending_target_f_ != -999 && target_f == this->pending_target_f_) {
+            ESP_LOGI(TAG, "Target-temperature change confirmed at %d°F", target_f);
+            this->pending_target_f_ = -999;
+          }
+        }
+        break;
+      }
+
+      case 0x04: {
+        if (this->model_ == MODEL_50) {
+          const uint8_t battery = frame[9];
+          ESP_LOGD(TAG, "Battery notification: %u%%", battery);
+          this->publish_battery_(battery);
+        }
+        break;
+      }
+
+      case 0x05: {
+        if (this->model_ == MODEL_30) {
+          const int current_f = static_cast<int>(frame[9]) - 128;
+          const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+          ESP_LOGD(TAG, "Current temperature notification: %d°F", current_f);
+          this->publish_current_temperature_(current_c);
+        }
+        break;
+      }
+
+      case 0x06: {
+        if (this->model_ == MODEL_50) {
+          const int current_f = static_cast<int>(frame[9]) - 128;
+          const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+          ESP_LOGD(TAG, "Zone 1 current temperature notification: %d°F", current_f);
+          this->publish_current_temperature_(current_c);
+        }
+        break;
+      }
+
+      case 0x07: {
+        if (this->model_ == MODEL_50) {
+          const int current_f = static_cast<int>(frame[9]) - 128;
+          const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
+          ESP_LOGD(TAG, "Zone 2 current temperature notification: %d°F", current_f);
+          this->publish_zone2_current_temperature_(current_c);
+        }
+        break;
+      }
+
+      case 0x0B: {
+        if (this->model_ == MODEL_30) {
+          const int target_f = static_cast<int>(frame[9]) - 128;
+          const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+          ESP_LOGD(TAG, "Target temperature notification: %d°F", target_f);
+          this->publish_target_temperature_(target_c);
+        }
+        break;
+      }
+
+      case 0x0C: {
+        if (this->model_ == MODEL_50) {
+          const int target_f = static_cast<int>(frame[9]) - 128;
+          const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+          ESP_LOGD(TAG, "Zone 1 target temperature notification: %d°F", target_f);
+          this->publish_target_temperature_(target_c);
+          if (this->pending_target_f_ == target_f)
+            this->pending_target_f_ = -999;
+        }
+        break;
+      }
+
+      case 0x0D: {
+        if (this->model_ == MODEL_50) {
+          const int target_f = static_cast<int>(frame[9]) - 128;
+          const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
+          ESP_LOGD(TAG, "Zone 2 target temperature notification: %d°F", target_f);
+          this->publish_zone2_target_temperature_(target_c);
+          if (this->pending_zone2_target_f_ == target_f)
+            this->pending_zone2_target_f_ = -999;
+        }
+        break;
+      }
+
+      case 0x02:
+        ESP_LOGD(TAG, "Unknown telemetry 0x02 value=%u", frame[9]);
+        break;
+
+      case 0x03:
+        ESP_LOGD(TAG, "Unknown telemetry 0x03 value=%u", frame[9]);
+        break;
+
+      case 0x14:
+        ESP_LOGD(TAG, "Unknown telemetry 0x14 value=%u", frame[9]);
+        break;
+
+      default:
+        ESP_LOGD(TAG, "Unhandled packet type 0x%02X", type);
+        break;
+    }
+  };
+
+  // The cooler can concatenate multiple protocol frames into a single BLE
+  // notification. Byte 7 contains the length of each individual frame.
+  uint16_t offset = 0;
+  while (offset < length) {
+    const uint16_t remaining = length - offset;
+    if (remaining < 8) {
+      ESP_LOGW(TAG, "Ignoring %u trailing BLE byte(s) after EverFrost frame", remaining);
+      return;
+    }
+
+    const uint8_t *frame = data + offset;
+    uint16_t frame_length = frame[7];
+
+    if (frame_length < 10 || frame_length > remaining) {
+      // Fallback for an unexpected frame where the length byte cannot be used,
+      // but the complete BLE notification itself has a valid checksum.
+      if (offset == 0 && this->validate_checksum_(data, length)) {
+        frame_length = length;
+      } else {
+        ESP_LOGW(TAG,
+                 "Invalid EverFrost framing at offset %u: declared=%u remaining=%u",
+                 offset, frame_length, remaining);
         return;
       }
-
-      const uint8_t battery = data[13];
-      this->publish_battery_(battery);
-
-      if (this->model_ == MODEL_50) {
-        // Confirmed 50L fields from the captured full-status packet.
-        // Power state is intentionally NOT taken from bytes 14/15 until we
-        // capture a full-status packet immediately after a zone power change.
-        const uint8_t screen_brightness = data[16];
-        const uint8_t voltage_protection = data[19];
-        const int zone1_current_f = static_cast<int>(data[20]) - 128;
-        const int zone1_target_f = static_cast<int>(data[21]) - 128;
-        const int zone2_current_f = static_cast<int>(data[23]) - 128;
-        const int zone2_target_f = static_cast<int>(data[24]) - 128;
-
-        const float zone1_current_c = (zone1_current_f - 32.0f) * 5.0f / 9.0f;
-        const float zone1_target_c = (zone1_target_f - 32.0f) * 5.0f / 9.0f;
-        const float zone2_current_c = (zone2_current_f - 32.0f) * 5.0f / 9.0f;
-        const float zone2_target_c = (zone2_target_f - 32.0f) * 5.0f / 9.0f;
-
-        ESP_LOGI(TAG,
-                 "Status 50: Z1 current=%d°F target=%d°F, Z2 current=%d°F target=%d°F, "
-                 "battery=%u%%, brightness=%u, voltage=%u",
-                 zone1_current_f, zone1_target_f, zone2_current_f, zone2_target_f,
-                 battery, screen_brightness, voltage_protection);
-
-        this->publish_screen_brightness_(screen_brightness);
-        this->publish_voltage_protection_(voltage_protection);
-        this->publish_current_temperature_(zone1_current_c);
-        this->publish_target_temperature_(zone1_target_c);
-        this->publish_zone2_current_temperature_(zone2_current_c);
-        this->publish_zone2_target_temperature_(zone2_target_c);
-
-        if (this->pending_target_f_ != -999 && zone1_target_f == this->pending_target_f_) {
-          ESP_LOGI(TAG, "Zone 1 target-temperature change confirmed at %d°F", zone1_target_f);
-          this->pending_target_f_ = -999;
-        }
-        if (this->pending_zone2_target_f_ != -999 &&
-            zone2_target_f == this->pending_zone2_target_f_) {
-          ESP_LOGI(TAG, "Zone 2 target-temperature change confirmed at %d°F", zone2_target_f);
-          this->pending_zone2_target_f_ = -999;
-        }
-      } else {
-        const int current_f = static_cast<int>(data[17]) - 128;
-        const int target_f = static_cast<int>(data[18]) - 128;
-        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
-        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
-
-        ESP_LOGI(TAG, "Status 30: current=%d°F, target=%d°F, battery=%u%%",
-                 current_f, target_f, battery);
-
-        this->publish_current_temperature_(current_c);
-        this->publish_target_temperature_(target_c);
-
-        if (this->pending_target_f_ != -999 && target_f == this->pending_target_f_) {
-          ESP_LOGI(TAG, "Target-temperature change confirmed at %d°F", target_f);
-          this->pending_target_f_ = -999;
-        }
-      }
-      break;
     }
 
-    case 0x04: {
-      if (this->model_ == MODEL_50) {
-        const uint8_t battery = data[9];
-        ESP_LOGD(TAG, "Battery notification: %u%%", battery);
-        this->publish_battery_(battery);
-      }
-      break;
-    }
+    if (offset != 0 || frame_length != length)
+      this->log_packet_("RX frame", frame, frame_length);
 
-    case 0x05: {
-      if (this->model_ == MODEL_30) {
-        const int current_f = static_cast<int>(data[9]) - 128;
-        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
-        ESP_LOGD(TAG, "Current temperature notification: %d°F", current_f);
-        this->publish_current_temperature_(current_c);
-      }
-      break;
-    }
-
-    case 0x06: {
-      if (this->model_ == MODEL_50) {
-        const int current_f = static_cast<int>(data[9]) - 128;
-        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
-        ESP_LOGD(TAG, "Zone 1 current temperature notification: %d°F", current_f);
-        this->publish_current_temperature_(current_c);
-      }
-      break;
-    }
-
-    case 0x07: {
-      if (this->model_ == MODEL_50) {
-        const int current_f = static_cast<int>(data[9]) - 128;
-        const float current_c = (current_f - 32.0f) * 5.0f / 9.0f;
-        ESP_LOGD(TAG, "Zone 2 current temperature notification: %d°F", current_f);
-        this->publish_zone2_current_temperature_(current_c);
-      }
-      break;
-    }
-
-    case 0x0B: {
-      if (this->model_ == MODEL_30) {
-        const int target_f = static_cast<int>(data[9]) - 128;
-        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
-        ESP_LOGD(TAG, "Target temperature notification: %d°F", target_f);
-        this->publish_target_temperature_(target_c);
-      }
-      break;
-    }
-
-    case 0x0C: {
-      if (this->model_ == MODEL_50) {
-        const int target_f = static_cast<int>(data[9]) - 128;
-        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
-        ESP_LOGD(TAG, "Zone 1 target temperature notification: %d°F", target_f);
-        this->publish_target_temperature_(target_c);
-        if (this->pending_target_f_ == target_f)
-          this->pending_target_f_ = -999;
-      }
-      break;
-    }
-
-    case 0x0D: {
-      if (this->model_ == MODEL_50) {
-        const int target_f = static_cast<int>(data[9]) - 128;
-        const float target_c = (target_f - 32.0f) * 5.0f / 9.0f;
-        ESP_LOGD(TAG, "Zone 2 target temperature notification: %d°F", target_f);
-        this->publish_zone2_target_temperature_(target_c);
-        if (this->pending_zone2_target_f_ == target_f)
-          this->pending_zone2_target_f_ = -999;
-      }
-      break;
-    }
-
-    case 0x02:
-      ESP_LOGD(TAG, "Unknown telemetry 0x02 value=%u", data[9]);
-      break;
-
-    case 0x03:
-      ESP_LOGD(TAG, "Unknown telemetry 0x03 value=%u", data[9]);
-      break;
-
-    case 0x14:
-      ESP_LOGD(TAG, "Unknown telemetry 0x14 value=%u", data[9]);
-      break;
-
-    default:
-      ESP_LOGD(TAG, "Unhandled packet type 0x%02X", type);
-      break;
+    parse_frame(frame, frame_length);
+    offset += frame_length;
   }
 }
 
