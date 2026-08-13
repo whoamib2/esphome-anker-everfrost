@@ -39,6 +39,9 @@ class EverFrostZoneClimate : public climate::Climate {
   EverFrostClimate *parent_{nullptr};
 };
 
+// Legacy select classes retained for ABI/source compatibility with the
+// monolithic implementation. New configurations use the direct classes below,
+// which send the exact no-response writes captured from both the 30L and 50L.
 class EverFrostVoltageProtectionSelect : public select::Select {
  public:
   void set_parent(EverFrostClimate *parent) { this->parent_ = parent; }
@@ -101,6 +104,36 @@ class EverFrostClimate : public climate::Climate,
   void set_voltage_protection(uint8_t level);
   void set_screen_brightness(uint8_t level);
 
+  // Direct setting write used by the select entities. The official Anker app
+  // uses ATT Write Command (write without response) on characteristic 0x7777
+  // for these setting commands on both the EverFrost 30 and EverFrost 50.
+  void send_setting_command_no_response(uint8_t command, uint8_t value) {
+#ifdef USE_ESP32
+    if (value > 2 || this->model_ == MODEL_UNKNOWN)
+      return;
+
+    if (!this->ready_ || this->write_handle_ == 0 || this->parent_ == nullptr)
+      return;
+
+    std::vector<uint8_t> packet{
+        0x08, 0xEE, 0x00, 0x00, 0x00, 0x02, command, 0x0B, 0x00, value,
+    };
+    packet.push_back(this->checksum_(packet.data(), packet.size()));
+    this->log_packet_("TX", packet.data(), packet.size());
+
+    auto status = esp_ble_gattc_write_char(
+        this->parent_->get_gattc_if(), this->parent_->get_conn_id(), this->write_handle_,
+        packet.size(), packet.data(), ESP_GATT_WRITE_TYPE_NO_RSP,
+        ESP_GATT_AUTH_REQ_NONE);
+
+    if (status == ESP_OK)
+      this->schedule_status_refresh_();
+#else
+    (void) command;
+    (void) value;
+#endif
+  }
+
  protected:
   void parse_packet_(const uint8_t *data, uint16_t length);
   bool validate_checksum_(const uint8_t *data, uint16_t length) const;
@@ -140,6 +173,36 @@ class EverFrostClimate : public climate::Climate,
   EverFrostZoneClimate *zone2_climate_{nullptr};
   select::Select *voltage_protection_select_{nullptr};
   select::Select *screen_brightness_select_{nullptr};
+};
+
+class EverFrostVoltageProtectionSelectDirect : public select::Select {
+ public:
+  void set_parent(EverFrostClimate *parent) { this->parent_ = parent; }
+
+ protected:
+  void control(size_t index) override {
+    if (this->parent_ == nullptr || index > 2)
+      return;
+    this->parent_->send_setting_command_no_response(0x85, static_cast<uint8_t>(index));
+    this->publish_state(index);
+  }
+
+  EverFrostClimate *parent_{nullptr};
+};
+
+class EverFrostScreenBrightnessSelectDirect : public select::Select {
+ public:
+  void set_parent(EverFrostClimate *parent) { this->parent_ = parent; }
+
+ protected:
+  void control(size_t index) override {
+    if (this->parent_ == nullptr || index > 2)
+      return;
+    this->parent_->send_setting_command_no_response(0x81, static_cast<uint8_t>(index));
+    this->publish_state(index);
+  }
+
+  EverFrostClimate *parent_{nullptr};
 };
 
 class EverFrostRefreshButton : public button::Button {
