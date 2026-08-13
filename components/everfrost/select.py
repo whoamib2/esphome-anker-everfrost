@@ -13,11 +13,11 @@ from .const import (
 
 everfrost_ns = cg.esphome_ns.namespace("everfrost")
 EverFrostVoltageProtectionSelect = everfrost_ns.class_(
-    "EverFrostVoltageProtectionSelect",
+    "EverFrostVoltageProtectionSelectDirect",
     select.Select,
 )
 EverFrostScreenBrightnessSelect = everfrost_ns.class_(
-    "EverFrostScreenBrightnessSelect",
+    "EverFrostScreenBrightnessSelectDirect",
     select.Select,
 )
 
