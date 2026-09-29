@@ -153,6 +153,13 @@ class EverFrostClimate : public climate::Climate,
   void publish_screen_brightness_(uint8_t level);
   void log_packet_(const char *prefix, const uint8_t *data, uint16_t length) const;
   void schedule_status_refresh_();
+  void cancel_session_timers_();
+  void reset_session_();
+  void begin_status_sync_();
+  void record_status_received_();
+  void request_reconnect_(const char *reason);
+  const char *peer_label_() const;
+
 
   static constexpr uint32_t SERVICE_UUID_30 = 0x0156F5DA;
   static constexpr uint32_t SERVICE_UUID_50 = 0x0158F5DA;
@@ -161,6 +168,14 @@ class EverFrostClimate : public climate::Climate,
 
   uint16_t write_handle_{0};
   uint16_t notify_handle_{0};
+  // ready_: CCCD enable write acknowledged; status_received_: full status parsed.
+  uint16_t notify_cccd_handle_{0};
+  bool notify_registration_pending_{false};
+  bool notify_registered_{false};
+  bool status_received_{false};
+  bool reconnect_pending_{false};
+  uint8_t recovery_failures_{0};
+  uint32_t session_generation_{0};
   bool ready_{false};
   bool raw_packet_logging_{false};
   Model model_{MODEL_UNKNOWN};
