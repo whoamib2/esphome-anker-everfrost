@@ -98,6 +98,7 @@ void EverFrostClimate::setup() {
 
 void EverFrostClimate::dump_config() {
   LOG_CLIMATE("", "Anker EverFrost", this);
+  ESP_LOGCONFIG(TAG, "  BLE recovery revision: 2026-09-28.1");
   ESP_LOGCONFIG(TAG, "  EverFrost 30 service UUID: 0x%08" PRIX32, SERVICE_UUID_30);
   ESP_LOGCONFIG(TAG, "  EverFrost 50 service UUID: 0x%08" PRIX32, SERVICE_UUID_50);
   ESP_LOGCONFIG(TAG, "  Write characteristic: 0x%04X", WRITE_CHAR_UUID);
@@ -157,7 +158,7 @@ void EverFrostClimate::update() { this->request_status(); }
 
 void EverFrostClimate::request_status() {
   if (!this->ready_) {
-    ESP_LOGD(TAG, "Status request skipped because BLE is not ready");
+    ESP_LOGD(TAG, "[%s] Status request skipped: notification setup not ready", this->peer_label_());
     return;
   }
   this->send_startup_request_();
@@ -350,6 +351,11 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
       return;
     }
 
+    if (frame[0] != 0x09 || frame[1] != 0xFF ||
+        (frame[5] != 0x01 && frame[5] != 0x02)) {
+      ESP_LOGW(TAG, "[%s] Ignoring unexpected frame header", this->peer_label_());
+      return;
+    }
     const uint8_t type = frame[6];
 
     // Command acknowledgements use 09 FF 00 00 01 02 CMD 0A 00 CS.
@@ -359,6 +365,10 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
       return;
     }
 
+    // A data frame needs at least one payload byte as well as its checksum.
+    if (frame_length < 11)
+      return;
+
     switch (type) {
       case 0x01: {
         if (frame_length < 54) {
@@ -366,6 +376,9 @@ void EverFrostClimate::parse_packet_(const uint8_t *data, uint16_t length) {
           return;
         }
 
+        if (!this->ready_ || this->model_ == MODEL_UNKNOWN)
+          return;
+        this->record_status_received_();
         const uint8_t battery = frame[13];
         this->publish_battery_(battery);
 
@@ -572,37 +585,180 @@ void EverFrostClimate::log_packet_(const char *prefix, const uint8_t *data,
       out += ' ';
     out += byte_text;
   }
-  ESP_LOGD(TAG, "%s [%u]: %s", prefix, length, out.c_str());
+  ESP_LOGD(TAG, "[%s] %s [%u]: %s", this->peer_label_(), prefix, length, out.c_str());
+}
+
+const char *EverFrostClimate::peer_label_() const {
+#ifdef USE_ESP32
+  if (this->parent_ != nullptr)
+    return this->parent_->address_str();
+#endif
+  return "EverFrost";
+}
+
+void EverFrostClimate::cancel_session_timers_() {
+  for (const char *name : {"setup_timeout", "initial_status", "status_retry_1", "status_retry_2",
+                           "initial_status_timeout", "status_watchdog", "post_write_refresh", "ble_reconnect"})
+    this->cancel_timeout(name);
+}
+
+void EverFrostClimate::reset_session_() {
+  this->cancel_session_timers_();
+  this->session_generation_++;
+  this->ready_ = false;
+  this->notify_registration_pending_ = false;
+  this->notify_registered_ = false;
+  this->status_received_ = false;
+  this->reconnect_pending_ = false;
+  this->write_handle_ = 0;
+  this->notify_handle_ = 0;
+  this->notify_cccd_handle_ = 0;
+  this->model_ = MODEL_UNKNOWN;
+  this->pending_target_f_ = -999;
+  this->pending_zone2_target_f_ = -999;
+  // Do not present stale readings as live data; never change physical zone power.
+  this->current_temperature = NAN;
+  this->target_temperature = NAN;
+  this->publish_state();
+  if (this->current_temperature_sensor_ != nullptr)
+    this->current_temperature_sensor_->publish_state(NAN);
+  if (this->battery_sensor_ != nullptr)
+    this->battery_sensor_->publish_state(NAN);
+  if (this->zone2_climate_ != nullptr)
+    this->zone2_climate_->publish_disconnected();
+  if (this->connected_binary_sensor_ != nullptr)
+    this->connected_binary_sensor_->publish_state(false);
+}
+
+void EverFrostClimate::begin_status_sync_() {
+  this->cancel_timeout("setup_timeout");
+  this->ready_ = true;
+  this->node_state = espbt::ClientState::ESTABLISHED;
+  ESP_LOGI(TAG, "[%s] Notifications enabled; waiting for first full status", this->peer_label_());
+  // Times are relative to the successful CCCD write, not to device boot.
+  this->set_timeout("initial_status", 500, [this]() {
+    if (this->ready_ && !this->status_received_)
+      this->request_status();
+  });
+  this->set_timeout("status_retry_1", 3000, [this]() {
+    if (this->ready_ && !this->status_received_) {
+      ESP_LOGW(TAG, "[%s] No initial status; retry 1", this->peer_label_());
+      this->request_status();
+    }
+  });
+  this->set_timeout("status_retry_2", 8000, [this]() {
+    if (this->ready_ && !this->status_received_) {
+      ESP_LOGW(TAG, "[%s] No initial status; retry 2", this->peer_label_());
+      this->request_status();
+    }
+  });
+  this->set_timeout("initial_status_timeout", 20000, [this]() {
+    if (this->ready_ && !this->status_received_)
+      this->request_reconnect_("No full status after startup retries");
+  });
+}
+
+void EverFrostClimate::record_status_received_() {
+  const bool first = !this->status_received_;
+  this->status_received_ = true;
+  this->recovery_failures_ = 0;
+  this->cancel_timeout("initial_status");
+  this->cancel_timeout("status_retry_1");
+  this->cancel_timeout("status_retry_2");
+  this->cancel_timeout("initial_status_timeout");
+  if (first) {
+    ESP_LOGI(TAG, "[%s] Cooler data confirmed; connection ready", this->peer_label_());
+    if (this->connected_binary_sensor_ != nullptr)
+      this->connected_binary_sensor_->publish_state(true);
+  }
+  // Three normal polling intervals plus a response margin, minimum 3 minutes.
+  // No forced recovery for intentionally disabled/very slow polling.
+  const uint32_t interval = this->get_update_interval();
+  if (interval > 0 && interval <= 3600000UL) {
+    const uint32_t timeout = std::max<uint32_t>(180000UL, interval * 3UL + 5000UL);
+    this->set_timeout("status_watchdog", timeout, [this]() {
+      if (this->ready_ && this->status_received_)
+        this->request_reconnect_("Full-status updates stopped");
+    });
+  }
+}
+
+void EverFrostClimate::request_reconnect_(const char *reason) {
+#ifdef USE_ESP32
+  if (this->parent_ == nullptr || this->reconnect_pending_)
+    return;
+  const uint16_t conn_id = this->parent_->get_conn_id();
+  this->reset_session_();
+  this->reconnect_pending_ = true;
+  // Keep attempts bounded when a peripheral repeatedly refuses initialization.
+  const uint32_t delay_ms = std::min<uint32_t>(30000UL, 1000UL << this->recovery_failures_);
+  if (this->recovery_failures_ < 5)
+    this->recovery_failures_++;
+  const uint32_t generation = this->session_generation_;
+  ESP_LOGW(TAG, "[%s] %s; recycling this BLE connection in %u ms",
+           this->peer_label_(), reason, static_cast<unsigned>(delay_ms));
+  this->set_timeout("ble_reconnect", delay_ms, [this, conn_id, generation]() {
+    if (this->reconnect_pending_ && this->session_generation_ == generation &&
+        this->parent_->get_conn_id() == conn_id)
+      this->parent_->disconnect();
+    // The configured auto_connect client handles discovery/reconnection.
+    // Do not restart the shared BLE stack, reboot, or touch Wi-Fi/WireGuard.
+  });
+#else
+  (void) reason;
+#endif
 }
 
 #ifdef USE_ESP32
 void EverFrostClimate::gattc_event_handler(esp_gattc_cb_event_t event,
                                            esp_gatt_if_t gattc_if,
                                            esp_ble_gattc_cb_param_t *param) {
+  if (this->parent_ == nullptr)
+    return;
+  // The parent normally filters events; retain interface/connection checks here
+  // so equal characteristic handles on the two coolers cannot cross sessions.
+  if (gattc_if != ESP_GATT_IF_NONE && gattc_if != this->parent_->get_gattc_if())
+    return;
+
   switch (event) {
+    case ESP_GATTC_CONNECT_EVT:
+      if (!this->parent_->check_addr(param->connect.remote_bda))
+        break;
+      this->reset_session_();
+      this->node_state = espbt::ClientState::CONNECTED;
+      this->set_timeout("setup_timeout", 20000, [this]() {
+        if (!this->ready_)
+          this->request_reconnect_("Notification setup timed out");
+      });
+      break;
+
     case ESP_GATTC_DISCONNECT_EVT:
-      this->ready_ = false;
-      this->write_handle_ = 0;
-      this->notify_handle_ = 0;
-      this->model_ = MODEL_UNKNOWN;
-      this->current_temperature = NAN;
-      this->target_temperature = NAN;
-      this->publish_state();
-      if (this->zone2_climate_ != nullptr)
-        this->zone2_climate_->publish_disconnected();
-      if (this->connected_binary_sensor_ != nullptr)
-        this->connected_binary_sensor_->publish_state(false);
-      ESP_LOGW(TAG, "EverFrost disconnected");
+      if (!this->parent_->check_addr(param->disconnect.remote_bda))
+        break;
+      ESP_LOGW(TAG, "[%s] BLE disconnected, reason=%u", this->peer_label_(), param->disconnect.reason);
+      this->reset_session_();
+      this->node_state = espbt::ClientState::IDLE;
+      break;
+
+    case ESP_GATTC_CLOSE_EVT:
+      this->reset_session_();
+      this->node_state = espbt::ClientState::IDLE;
       break;
 
     case ESP_GATTC_SEARCH_CMPL_EVT: {
+      if (param->search_cmpl.conn_id != this->parent_->get_conn_id() || this->reconnect_pending_)
+        break;
+      // Hold service memory until the notification descriptor write completes.
+      this->node_state = espbt::ClientState::CONNECTED;
+      if (param->search_cmpl.status != ESP_GATT_OK) {
+        this->request_reconnect_("Service discovery failed");
+        break;
+      }
       const auto write_uuid = espbt::ESPBTUUID::from_uint16(WRITE_CHAR_UUID);
       const auto notify_uuid = espbt::ESPBTUUID::from_uint16(NOTIFY_CHAR_UUID);
-
       auto service_uuid = espbt::ESPBTUUID::from_uint32(SERVICE_UUID_30);
       auto *write_chr = this->parent_->get_characteristic(service_uuid, write_uuid);
       auto *notify_chr = this->parent_->get_characteristic(service_uuid, notify_uuid);
-
       if (write_chr != nullptr && notify_chr != nullptr) {
         this->model_ = MODEL_30;
       } else {
@@ -612,42 +768,62 @@ void EverFrostClimate::gattc_event_handler(esp_gattc_cb_event_t event,
         if (write_chr != nullptr && notify_chr != nullptr)
           this->model_ = MODEL_50;
       }
-
       if (write_chr == nullptr || notify_chr == nullptr || this->model_ == MODEL_UNKNOWN) {
-        ESP_LOGE(TAG, "Required EverFrost BLE characteristics were not found");
-        return;
+        this->request_reconnect_("Required EverFrost characteristics not found");
+        break;
       }
-
       if (this->model_ == MODEL_50 && this->zone2_climate_ == nullptr)
         ESP_LOGW(TAG, "EverFrost 50 detected but no zone_2 climate is configured");
-
-      ESP_LOGI(TAG, "Detected EverFrost %s BLE protocol",
-               this->model_ == MODEL_50 ? "50" : "30");
-
       this->write_handle_ = write_chr->handle;
       this->notify_handle_ = notify_chr->handle;
-
-      auto status = esp_ble_gattc_register_for_notify(
-          this->parent_->get_gattc_if(), this->parent_->get_remote_bda(),
-          this->notify_handle_);
-      if (status != ESP_OK)
-        ESP_LOGE(TAG, "Register-for-notify failed, status=%d", status);
+      auto *cccd = this->parent_->get_config_descriptor(this->notify_handle_);
+      if (cccd == nullptr) {
+        this->request_reconnect_("Notification configuration descriptor not found");
+        break;
+      }
+      this->notify_cccd_handle_ = cccd->handle;
+      ESP_LOGI(TAG, "[%s] Detected EverFrost %u; registering notifications", this->peer_label_(), this->model_);
+      this->notify_registration_pending_ = true;
+      const auto status = this->parent_->register_for_notify(this->notify_handle_);
+      if (status != ESP_OK) {
+        ESP_LOGW(TAG, "[%s] Notification registration request failed: %d", this->peer_label_(), status);
+        this->request_reconnect_("Notification registration request failed");
+      }
       break;
     }
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT:
-      if (param->reg_for_notify.handle != this->notify_handle_)
+      if (!this->notify_registration_pending_ || this->reconnect_pending_ ||
+          param->reg_for_notify.handle != this->notify_handle_)
         break;
-      this->ready_ = true;
-      this->node_state = espbt::ClientState::ESTABLISHED;
-      if (this->connected_binary_sensor_ != nullptr)
-        this->connected_binary_sensor_->publish_state(true);
-      ESP_LOGI(TAG, "EverFrost BLE connection is ready");
-      this->set_timeout("initial_status", 250, [this]() { this->request_status(); });
+      this->notify_registration_pending_ = false;
+      if (param->reg_for_notify.status != ESP_GATT_OK) {
+        ESP_LOGW(TAG, "[%s] Notification registration failed: %u", this->peer_label_(), param->reg_for_notify.status);
+        this->request_reconnect_("Notification registration failed");
+        break;
+      }
+      this->notify_registered_ = true;
+      // BLEClientBase writes the CCCD; do not send a competing duplicate write.
+      ESP_LOGD(TAG, "[%s] Registration OK; waiting for notification-enable acknowledgement", this->peer_label_());
+      break;
+
+    case ESP_GATTC_WRITE_DESCR_EVT:
+      if (!this->notify_registered_ || this->ready_ || this->reconnect_pending_ ||
+          param->write.conn_id != this->parent_->get_conn_id() ||
+          param->write.handle != this->notify_cccd_handle_)
+        break;
+      if (param->write.status != ESP_GATT_OK) {
+        ESP_LOGW(TAG, "[%s] Notification-enable write failed: %u", this->peer_label_(), param->write.status);
+        this->request_reconnect_("Notification-enable write failed");
+        break;
+      }
+      this->begin_status_sync_();
       break;
 
     case ESP_GATTC_NOTIFY_EVT:
-      if (param->notify.handle == this->notify_handle_)
+      if (this->ready_ && !this->reconnect_pending_ &&
+          param->notify.conn_id == this->parent_->get_conn_id() &&
+          param->notify.handle == this->notify_handle_)
         this->parse_packet_(param->notify.value, param->notify.value_len);
       break;
 
